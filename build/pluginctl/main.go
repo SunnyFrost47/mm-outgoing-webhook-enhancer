@@ -2,18 +2,14 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
-	"time"
 
-	"github.com/mattermost/mattermost/server/public/model"
+	"github.com/mattermost/mattermost-server/v6/model"
 )
-
-const commandTimeout = 120 * time.Second
 
 const helpText = `
 Usage:
@@ -37,10 +33,7 @@ func pluginctl() error {
 		return errors.New("invalid number of arguments")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
-	defer cancel()
-
-	client, err := getClient(ctx)
+	client, err := getClient()
 	if err != nil {
 		return err
 	}
@@ -50,23 +43,19 @@ func pluginctl() error {
 		if len(os.Args) < 4 {
 			return errors.New("invalid number of arguments")
 		}
-		return deploy(ctx, client, os.Args[2], os.Args[3])
+		return deploy(client, os.Args[2], os.Args[3])
 	case "disable":
-		return disablePlugin(ctx, client, os.Args[2])
+		return disablePlugin(client, os.Args[2])
 	case "enable":
-		return enablePlugin(ctx, client, os.Args[2])
+		return enablePlugin(client, os.Args[2])
 	case "reset":
-		return resetPlugin(ctx, client, os.Args[2])
-	case "logs":
-		return logs(ctx, client, os.Args[2])
-	case "logs-watch":
-		return watchLogs(context.WithoutCancel(ctx), client, os.Args[2]) // Keep watching forever
+		return resetPlugin(client, os.Args[2])
 	default:
 		return errors.New("invalid second argument")
 	}
 }
 
-func getClient(ctx context.Context) (*model.Client4, error) {
+func getClient() (*model.Client4, error) {
 	socketPath := os.Getenv("MM_LOCALSOCKETPATH")
 	if socketPath == "" {
 		socketPath = model.LocalModeSocketPath
@@ -102,7 +91,7 @@ func getClient(ctx context.Context) (*model.Client4, error) {
 	if adminUsername != "" && adminPassword != "" {
 		client := model.NewAPIv4Client(siteURL)
 		log.Printf("Authenticating as %s against %s.", adminUsername, siteURL)
-		_, _, err := client.Login(ctx, adminUsername, adminPassword)
+		_, _, err := client.Login(adminUsername, adminPassword)
 		if err != nil {
 			return nil, fmt.Errorf("failed to login as %s: %w", adminUsername, err)
 		}
@@ -124,21 +113,21 @@ func getUnixClient(socketPath string) (*model.Client4, bool) {
 
 // deploy attempts to upload and enable a plugin via the Client4 API.
 // It will fail if plugin uploads are disabled.
-func deploy(ctx context.Context, client *model.Client4, pluginID, bundlePath string) error {
-	pluginBundle, err := os.Open(bundlePath) //nolint:gosec
+func deploy(client *model.Client4, pluginID, bundlePath string) error {
+	pluginBundle, err := os.Open(bundlePath)
 	if err != nil {
 		return fmt.Errorf("failed to open %s: %w", bundlePath, err)
 	}
-	defer func() { _ = pluginBundle.Close() }()
+	defer pluginBundle.Close()
 
 	log.Print("Uploading plugin via API.")
-	_, _, err = client.UploadPluginForced(ctx, pluginBundle)
+	_, _, err = client.UploadPluginForced(pluginBundle)
 	if err != nil {
 		return fmt.Errorf("failed to upload plugin bundle: %s", err.Error())
 	}
 
 	log.Print("Enabling plugin.")
-	_, err = client.EnablePlugin(ctx, pluginID)
+	_, err = client.EnablePlugin(pluginID)
 	if err != nil {
 		return fmt.Errorf("failed to enable plugin: %s", err.Error())
 	}
@@ -147,9 +136,9 @@ func deploy(ctx context.Context, client *model.Client4, pluginID, bundlePath str
 }
 
 // disablePlugin attempts to disable the plugin via the Client4 API.
-func disablePlugin(ctx context.Context, client *model.Client4, pluginID string) error {
+func disablePlugin(client *model.Client4, pluginID string) error {
 	log.Print("Disabling plugin.")
-	_, err := client.DisablePlugin(ctx, pluginID)
+	_, err := client.DisablePlugin(pluginID)
 	if err != nil {
 		return fmt.Errorf("failed to disable plugin: %w", err)
 	}
@@ -158,9 +147,9 @@ func disablePlugin(ctx context.Context, client *model.Client4, pluginID string) 
 }
 
 // enablePlugin attempts to enable the plugin via the Client4 API.
-func enablePlugin(ctx context.Context, client *model.Client4, pluginID string) error {
+func enablePlugin(client *model.Client4, pluginID string) error {
 	log.Print("Enabling plugin.")
-	_, err := client.EnablePlugin(ctx, pluginID)
+	_, err := client.EnablePlugin(pluginID)
 	if err != nil {
 		return fmt.Errorf("failed to enable plugin: %w", err)
 	}
@@ -169,13 +158,13 @@ func enablePlugin(ctx context.Context, client *model.Client4, pluginID string) e
 }
 
 // resetPlugin attempts to reset the plugin via the Client4 API.
-func resetPlugin(ctx context.Context, client *model.Client4, pluginID string) error {
-	err := disablePlugin(ctx, client, pluginID)
+func resetPlugin(client *model.Client4, pluginID string) error {
+	err := disablePlugin(client, pluginID)
 	if err != nil {
 		return err
 	}
 
-	err = enablePlugin(ctx, client, pluginID)
+	err = enablePlugin(client, pluginID)
 	if err != nil {
 		return err
 	}

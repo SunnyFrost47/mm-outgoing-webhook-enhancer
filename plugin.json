@@ -1,13 +1,13 @@
 {
-    "id": "com.mattermost.plugin-starter-template",
-    "name": "Plugin Starter Template",
-    "description": "This plugin serves as a starting point for writing a Mattermost plugin.",
-    "homepage_url": "https://github.com/mattermost/mattermost-plugin-starter-template",
-    "support_url": "https://github.com/mattermost/mattermost-plugin-starter-template/issues",
-    "release_notes_url": "https://github.com/mattermost/mattermost-plugin-starter-template/releases/tag/v0.1.0",
+    "id": "mm-outgoing-webhook-enhancer",
+    "name": "Outgoing Webhook Enhancer",
+    "description": "Enables outgoing webhook functionality in private channels and direct messages.",
+    "homepage_url": "https://github.com/SunnyFrost47/mm-outgoing-webhook-enhancer",
+    "support_url": "https://github.com/SunnyFrost47/mm-outgoing-webhook-enhancer/issues",
+    "release_notes_url": "https://github.com/SunnyFrost47/mm-outgoing-webhook-enhancer/releases/tag/v0.1.0",
     "icon_path": "assets/starter-template-icon.svg",
-    "version": "0.1.0",
-    "min_server_version": "5.12.0",
+    "version": "1.0.0",
+    "min_server_version": "5.31.0",
     "server": {
         "executables": {
             "linux-amd64": "server/dist/plugin-linux-amd64",
@@ -21,7 +21,7 @@
         "bundle_path": "webapp/dist/main.js"
     },
     "settings_schema": {
-        "header": "",
+        "header": "Enhances outgoing webhooks to work in private channels and DMs.",
         "footer": "",
         "settings": []
     }

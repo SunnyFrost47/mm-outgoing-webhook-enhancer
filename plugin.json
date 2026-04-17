@@ -7,7 +7,7 @@
     "release_notes_url": "https://github.com/SunnyFrost47/mm-outgoing-webhook-enhancer/releases/tag/v0.1.0",
     "icon_path": "assets/starter-template-icon.svg",
     "version": "1.0.0",
-    "min_server_version": "5.31.0",
+    "min_server_version": "5.31.3",
     "server": {
         "executables": {
             "linux-amd64": "server/dist/plugin-linux-amd64",
@@ -23,6 +23,15 @@
     "settings_schema": {
         "header": "Enhances outgoing webhooks to work in private channels and DMs.",
         "footer": "",
-        "settings": []
+        "settings": [
+            {
+                "key": "Debug",
+                "display_name": "Debug Mode",
+                "type": "bool",
+                "help_text": "Enable debug logging to track plugin operations.",
+                "placeholder": "",
+                "default": false
+            }
+        ]
     }
 }

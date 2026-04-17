@@ -1,35 +1,83 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
 	"reflect"
 
+	"github.com/mattermost/mattermost-server/v5/model"
 	"github.com/pkg/errors"
 )
 
-// configuration captures the plugin's external configuration as exposed in the Mattermost server
-// configuration, as well as values computed from the configuration. Any public fields will be
-// deserialized from the Mattermost server configuration in OnConfigurationChange.
+// Структура configuration содержит внешнюю конфигурацию плагина, отображаемую в конфигурации сервера Mattermost,
+// а также значения, вычисленные на основе этой конфигурации. Любые общедоступные поля будут десериализованы
+// из конфигурации сервера Mattermost в методе OnConfigurationChange.
 //
-// As plugins are inherently concurrent (hooks being called asynchronously), and the plugin
-// configuration can change at any time, access to the configuration must be synchronized. The
-// strategy used in this plugin is to guard a pointer to the configuration, and clone the entire
-// struct whenever it changes. You may replace this with whatever strategy you choose.
-//
-// If you add non-reference types to your configuration struct, be sure to rewrite Clone as a deep
-// copy appropriate for your types.
+// Поскольку плагины по своей природе являются параллельными (хуки вызываются асинхронно),
+// и конфигурация плагина может изменяться в любой момент, доступ к конфигурации должен быть синхронизирован.
+// В этом плагине используется стратегия защиты указателя на конфигурацию и клонирования всей структуры при каждом её изменении.
 type configuration struct {
+	Debug bool `json:"debug"`
+
+	// OutgoingWebhooks - массив кастомных исходящих вебхуков.
+	OutgoingWebhooks []*CustomOutgoingWebhook `json:"outgoing_webhooks"`
 }
 
-// Clone shallow copies the configuration. Your implementation may require a deep copy if
-// your configuration has reference types.
+// CustomOutgoingWebhook определяет один кастомный исходящий вебхук.
+type CustomOutgoingWebhook struct {
+	// ID - уникальный идентификатор (генерируется автоматически, если не задан).
+	ID string `json:"id"`
+	// Enabled - активен ли вебхук.
+	Enabled bool `json:"enabled"`
+	// DisplayName - отображаемое имя (для админки).
+	DisplayName string `json:"display_name"`
+	// TriggerWords - список слов-триггеров.
+	TriggerWords []string `json:"trigger_words"`
+	// TriggerWhen - условие срабатывания: "startswith", "exact", "regex".
+	TriggerWhen string `json:"trigger_when"`
+	// CallbackURLs - список конечных точек, куда будет отправлен POST-запрос.
+	CallbackURLs []string `json:"callback_urls"`
+	// ContentType - тип содержимого запроса ("application/json" или "application/x-www-form-urlencoded").
+	ContentType string `json:"content_type"`
+	// Secret - секретный токен для подписи запроса (опционально).
+	Secret string `json:"secret"`
+	// ChannelIDs - ограничение каналов (пустой массив = все каналы).
+	ChannelIDs []string `json:"channel_ids"`
+	// Username - имя пользователя, от которого отправлено сообщение (опционально).
+	Username string `json:"username"`
+}
+
+// Validate проверяет обязательные поля и корректность структуры.
+func (h *CustomOutgoingWebhook) Validate() error {
+	if h.ID == "" {
+		return errors.New("id is required")
+	}
+	if len(h.TriggerWords) == 0 {
+		return errors.New("at least one trigger word is required")
+	}
+	if len(h.CallbackURLs) == 0 {
+		return errors.New("at least one callback_urls is required")
+	}
+	if h.TriggerWhen != "" && h.TriggerWhen != "startswith" && h.TriggerWhen != "exact" && h.TriggerWhen != "regex" {
+		return errors.New("trigger_when must be one of: startswith, exact, regex")
+	}
+	if h.ContentType != "" && h.ContentType != "application/json" && h.ContentType != "application/x-www-form-urlencoded" {
+		return errors.New("content_type must be application/json or application/x-www-form-urlencoded")
+	}
+	return nil
+}
+
+// Clone возвращает глубокую копию конфигурации.
 func (c *configuration) Clone() *configuration {
-	var clone = *c
+	var clone configuration
+	data, _ := json.Marshal(c)
+	_ = json.Unmarshal(data, &clone)
 	return &clone
 }
 
-// getConfiguration retrieves the active configuration under lock, making it safe to use
-// concurrently. The active configuration may change underneath the client of this method, but
-// the struct returned by this API call is considered immutable.
+// getConfiguration извлекает текущую конфигурацию из хранилища плагина.
+// Используется sync.RWMutex для потокобезопасности.
 func (p *Plugin) getConfiguration() *configuration {
 	p.configurationLock.RLock()
 	defer p.configurationLock.RUnlock()
@@ -50,7 +98,7 @@ func (p *Plugin) getConfiguration() *configuration {
 // This method panics if setConfiguration is called with the existing configuration. This almost
 // certainly means that the configuration was modified without being cloned and may result in
 // an unsafe access.
-func (p *Plugin) setConfiguration(configuration *configuration) {
+func (p *Plugin) setConfiguration(configuration *configuration) error {
 	p.configurationLock.Lock()
 	defer p.configurationLock.Unlock()
 
@@ -59,17 +107,30 @@ func (p *Plugin) setConfiguration(configuration *configuration) {
 		// allocation for same to point at the same memory address, breaking the check
 		// above.
 		if reflect.ValueOf(*configuration).NumField() == 0 {
-			return
+			return nil
 		}
 
 		panic("setConfiguration called with the existing configuration")
 	}
 
+	// Валидация всех вебхуков перед сохранением.
+	for _, wh := range configuration.OutgoingWebhooks {
+		if err := wh.Validate(); err != nil {
+			return errors.Wrapf(err, "invalid webhook %s", wh.ID)
+		}
+	}
+
 	p.configuration = configuration
+	return nil
 }
 
-// OnConfigurationChange is invoked when configuration changes may have been made.
+// OnConfigurationChange обрабатывает событие изменения конфигурации.
 func (p *Plugin) OnConfigurationChange() error {
+	if p.API == nil {
+		// Во время тестирования API может быть равен нулю.
+		fmt.Fprintf(os.Stderr, "ERROR: OnConfigurationChange called but p.API is nil\n")
+		return errors.New("API is nil")
+	}
 	var configuration = new(configuration)
 
 	// Load the public configuration fields from the Mattermost server configuration.
@@ -77,7 +138,20 @@ func (p *Plugin) OnConfigurationChange() error {
 		return errors.Wrap(err, "failed to load plugin configuration")
 	}
 
-	p.setConfiguration(configuration)
+	// Автоматически генерируем ID для вебхуков, если они пустые.
+	for _, wh := range configuration.OutgoingWebhooks {
+		if wh.ID == "" {
+			wh.ID = model.NewId()
+		}
+	}
+
+	// Сохраняем конфигурацию в плагине (с валидацией).
+	if err := p.setConfiguration(configuration); err != nil {
+		return err
+	}
+
+	// Логируем успешную загрузку конфигурации.
+	p.API.LogDebug("Configuration loaded", "webhooks_count", len(configuration.OutgoingWebhooks))
 
 	return nil
 }

@@ -1,29 +1,46 @@
 package main
 
 import (
-	"fmt"
-	"net/http"
 	"sync"
 
-	//"github.com/mattermost/mattermost-server/v5/model"
+	"github.com/gorilla/mux"
+
+	"github.com/mattermost/mattermost-server/v5/model"
 	"github.com/mattermost/mattermost-server/v5/plugin"
 )
 
-// Plugin implements the interface expected by the Mattermost server to communicate between the server and plugin processes.
+// Плагин реализует интерфейс, ожидаемый сервером Mattermost для связи между сервером и процессами плагина.
 type Plugin struct {
 	plugin.MattermostPlugin
 
-	// configurationLock synchronizes access to the configuration.
+	// configurationLock синхронизирует доступ к конфигурации.
 	configurationLock sync.RWMutex
 
-	// configuration is the active plugin configuration. Consult getConfiguration and
-	// setConfiguration for usage.
+	// configuration это активная конфигурация плагина. Для получения информации об использовании см. getConfiguration и setConfiguration.
 	configuration *configuration
+
+	router *mux.Router
+
+	outgoingWebhooks map[string][]*model.OutgoingWebhook
 }
 
-// ServeHTTP demonstrates a plugin that handles HTTP requests by greeting the world.
-func (p *Plugin) ServeHTTP(c *plugin.Context, w http.ResponseWriter, r *http.Request) {
-	fmt.Fprint(w, "Hello, world!")
+// OnActivate это метод, вызываемый сервером Mattermost после активации плагина.
+func (p *Plugin) OnActivate() error {
+	// Принудительно загружаем конфигурацию.
+	if err := p.OnConfigurationChange(); err != nil {
+		return err
+	}
+
+	p.outgoingWebhooks = make(map[string][]*model.OutgoingWebhook)
+	p.initializeAPI()
+
+	return nil
+}
+
+func (p *Plugin) OnDeactivate() error {
+	p.outgoingWebhooks = nil
+
+	return nil
 }
 
 // See https://developers.mattermost.com/extend/plugins/server/reference/

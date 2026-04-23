@@ -6,7 +6,6 @@ import (
 	"os"
 	"reflect"
 
-	"github.com/mattermost/mattermost-server/v5/model"
 	"github.com/pkg/errors"
 )
 
@@ -18,20 +17,19 @@ import (
 // и конфигурация плагина может изменяться в любой момент, доступ к конфигурации должен быть синхронизирован.
 // В этом плагине используется стратегия защиты указателя на конфигурацию и клонирования всей структуры при каждом её изменении.
 type configuration struct {
-	Debug bool `json:"debug"`
+	Debug        bool   `json:"debug"`
+	JsonWebHooks string `json:"outgoing_webhooks"`
 
 	// OutgoingWebhooks - массив кастомных исходящих вебхуков.
-	OutgoingWebhooks []*CustomOutgoingWebhook `json:"outgoing_webhooks"`
+	OutgoingWebhooks []*CustomOutgoingWebhook
 }
 
 // CustomOutgoingWebhook определяет один кастомный исходящий вебхук.
 type CustomOutgoingWebhook struct {
-	// ID - уникальный идентификатор (генерируется автоматически, если не задан).
-	ID string `json:"id"`
-	// Enabled - активен ли вебхук.
-	Enabled bool `json:"enabled"`
 	// DisplayName - отображаемое имя (для админки).
 	DisplayName string `json:"display_name"`
+	// Enabled - активен ли вебхук.
+	Enabled bool `json:"enabled"`
 	// TriggerWords - список слов-триггеров.
 	TriggerWords []string `json:"trigger_words"`
 	// TriggerWhen - условие срабатывания: "startswith", "exact", "regex".
@@ -41,20 +39,20 @@ type CustomOutgoingWebhook struct {
 	// ContentType - тип содержимого запроса ("application/json" или "application/x-www-form-urlencoded").
 	ContentType string `json:"content_type"`
 	// Secret - секретный токен для подписи запроса (опционально).
-	Secret string `json:"secret"`
+	Token string `json:"secret"`
 	// ChannelIDs - ограничение каналов (пустой массив = все каналы).
 	ChannelIDs []string `json:"channel_ids"`
-	// Username - имя пользователя, от которого отправлено сообщение (опционально).
-	Username string `json:"username"`
+	// Enabled - активен ли вебхук.
+	CheckBotAccess bool `json:"check_bot_access"`
 }
 
 // Validate проверяет обязательные поля и корректность структуры.
 func (h *CustomOutgoingWebhook) Validate() error {
-	if h.ID == "" {
-		return errors.New("id is required")
+	if h.DisplayName == "" {
+		return errors.New("display name is required")
 	}
-	if len(h.TriggerWords) == 0 {
-		return errors.New("at least one trigger word is required")
+	if len(h.TriggerWords) == 0 && len(h.ChannelIDs) == 0 {
+		return errors.New("at least one trigger word or channel is required")
 	}
 	if len(h.CallbackURLs) == 0 {
 		return errors.New("at least one callback_urls is required")
@@ -116,7 +114,7 @@ func (p *Plugin) setConfiguration(configuration *configuration) error {
 	// Валидация всех вебхуков перед сохранением.
 	for _, wh := range configuration.OutgoingWebhooks {
 		if err := wh.Validate(); err != nil {
-			return errors.Wrapf(err, "invalid webhook %s", wh.ID)
+			return errors.Wrapf(err, "invalid webhook %s", wh.DisplayName)
 		}
 	}
 
@@ -138,20 +136,30 @@ func (p *Plugin) OnConfigurationChange() error {
 		return errors.Wrap(err, "failed to load plugin configuration")
 	}
 
-	// Автоматически генерируем ID для вебхуков, если они пустые.
-	for _, wh := range configuration.OutgoingWebhooks {
-		if wh.ID == "" {
-			wh.ID = model.NewId()
+	if configuration.JsonWebHooks == "" {
+		configuration.OutgoingWebhooks = []*CustomOutgoingWebhook{}
+	} else {
+		if err := json.Unmarshal([]byte(configuration.JsonWebHooks), &configuration.OutgoingWebhooks); err != nil {
+			// Логируем ошибку, чтобы администратор видел её в логах Mattermost
+			p.API.LogError("Failed to parse OutgoingWebhooks JSON setting", "error", err.Error())
+			return errors.Wrap(err, "invalid JSON format in settings")
 		}
+	}
+
+	// Логируем успешную загрузку конфигурации.
+	p.API.LogInfo("Configuration loaded", "webhooks_count", len(configuration.OutgoingWebhooks))
+
+	// Дополнительно: вывести первый вебхук, если есть
+	if len(configuration.OutgoingWebhooks) > 0 {
+		p.API.LogDebug("First webhook",
+			"id", configuration.OutgoingWebhooks[0].DisplayName,
+			"secret", configuration.OutgoingWebhooks[0].Token) // убедитесь, что Secret не пуст
 	}
 
 	// Сохраняем конфигурацию в плагине (с валидацией).
 	if err := p.setConfiguration(configuration); err != nil {
 		return err
 	}
-
-	// Логируем успешную загрузку конфигурации.
-	p.API.LogDebug("Configuration loaded", "webhooks_count", len(configuration.OutgoingWebhooks))
 
 	return nil
 }

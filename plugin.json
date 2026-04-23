@@ -31,6 +31,12 @@
                 "help_text": "Enable debug logging to track plugin operations.",
                 "placeholder": "",
                 "default": false
+            },
+            {
+              "key": "Outgoing_Webhooks",
+              "display_name": "Список вебхуков",
+              "type": "custom",
+              "help_text": "JSON-массив объектов вебхуков (смотрите документацию плагина)"
             }
         ]
     }

@@ -1,8 +1,9 @@
-package main // Функция MessageHasBeenPosted вызывается сервером Mattermost после отправки сообщения.
+package main
 
 import (
 	"encoding/json"
 	"net/http"
+	"regexp"
 	"strings"
 
 	"github.com/mattermost/mattermost-server/v5/model"
@@ -10,6 +11,8 @@ import (
 	"github.com/pkg/errors"
 )
 
+// Функция MessageHasBeenPosted вызывается сервером Mattermost после отправки сообщения.
+// Проверяем, есть ли подходящий вебхук и если есть, то отправляем запрос
 func (p *Plugin) MessageHasBeenPosted(c *plugin.Context, post *model.Post) {
 	if post == nil {
 		return
@@ -34,19 +37,7 @@ func (p *Plugin) MessageHasBeenPosted(c *plugin.Context, post *model.Post) {
 		return
 	}
 
-	// Получаем список исходящих вебхуков и кешируем
-	if (p.outgoingWebhooks == nil) || (len(p.outgoingWebhooks[channel.TeamId]) == 0) {
-		hooks, err := p.getOutgoingWebhooks(channel.TeamId)
-
-		if err != nil {
-			p.API.LogError("Failed to get outgoing webhooks", "error", err.Error())
-			return
-		}
-
-		p.outgoingWebhooks[channel.TeamId] = hooks
-	}
-
-	outWebhooksByTeam := p.outgoingWebhooks[channel.TeamId]
+	customWebhooks := p.getConfiguration().OutgoingWebhooks
 
 	// Логируем полученные вебхуки (только при включённой отладке)
 	if p.getConfiguration().Debug {
@@ -54,143 +45,201 @@ func (p *Plugin) MessageHasBeenPosted(c *plugin.Context, post *model.Post) {
 			"message", post.Message,
 			"channel", channel.Name,
 			"channel_type", channel.Type,
-			"webhooks_count", len(outWebhooksByTeam))
+			"webhooks_count", len(customWebhooks))
 	}
 
 	// Обрабатываем каждый вебхук
-	for _, wh := range outWebhooksByTeam {
+	for _, wh := range customWebhooks {
 		p.processWebhook(wh, post, user, channel)
 	}
 }
 
-// GetOutgoingWebhooks возвращает список исходящих вебхуков
-func (p *Plugin) getOutgoingWebhooks(teamId string) ([]*model.OutgoingWebhook, *model.AppError) {
-	// Инициализация клиента API v4
-	siteURL := *p.API.GetConfig().ServiceSettings.SiteURL
-	if siteURL == "" {
-		return nil, model.NewAppError("getOutgoingWebhooks", "plugin.site_url_empty", nil, "SiteURL is empty", 500)
-	}
-	client := model.NewAPIv4Client(siteURL)
-
-	// Установка токена бота
-	botToken := "yt4mzkm4tbgqurmxr4ocg7q37c"
-	client.SetToken(botToken)
-
-	/*myClient := &http.Client{}
-	req, _ := http.NewRequest("GET", siteURL+"/api/v4/hooks/outgoing?per_page=100&team_id="+teamId, nil)
-	req.Header.Set("Authorization", "Bearer "+botToken)
-	respHttp, err := myClient.Do(req)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "DEBUG: getOutgoingWebhooks err: %v\n", err)
-		return nil, model.NewAppError("getOutgoingWebhooks", "plugin.site_url_empty", nil, "SiteURL is empty", 500)
-	}
-	body, _ := io.ReadAll(respHttp.Body)
-	fmt.Fprintf(os.Stderr, "DEBUG: getOutgoingWebhooks response: %v\n", body)
-	if respHttp.StatusCode != 200 {
-		p.API.LogError("HTTP error", "status", respHttp.StatusCode, "body", string(body))
-		return nil, model.NewAppError("getOutgoingWebhooks", "plugin.site_url_empty", nil, "SiteURL is empty", 500)
-	}*/
-
-	// Получение списка исходящих вебхуков
-	hooks, resp := client.GetOutgoingWebhooks(0, 100, teamId)
-	if resp.Error != nil {
-		return nil, resp.Error
-	}
-
-	return hooks, nil
-}
-
-func (p *Plugin) processWebhook(wh *model.OutgoingWebhook, post *model.Post, user *model.User, channel *model.Channel) {
+func (p *Plugin) processWebhook(wh *CustomOutgoingWebhook, post *model.Post, user *model.User, channel *model.Channel) {
 	// Проверка, активен ли вебхук
-	if wh.CreatorId == "" {
+	if !wh.Enabled {
 		return
 	}
 
 	// Проверка канала, если указан
-	if wh.ChannelId != "" && wh.ChannelId != post.ChannelId {
+	if len(wh.ChannelIDs) != 0 && !contains(wh.ChannelIDs, post.ChannelId) {
 		return
 	}
 
 	// Проверка триггерных слов
-	triggerMatch := p.checkTriggerWords(wh, post.Message)
+	triggerMatch, triggerWord := p.checkTriggerWords(wh, post.Message)
 	if !triggerMatch {
 		return
 	}
 
-	// Отправка HTTP-запроса
-	response, err := p.sendHTTPRequest(wh, post, user, channel)
-	if err != nil {
-		p.API.LogError("Failed to send HTTP request",
-			"webhook_id", wh.Id,
-			"error", err.Error())
+	// Логируем (только при включённой отладке)
+	if p.getConfiguration().Debug {
+		p.API.LogDebug("Trigger Matched",
+			"trigger_word", triggerWord,
+			"check_bot_access", wh.CheckBotAccess)
+	}
+
+	if !p.checkAccessToChannel(wh, channel, triggerWord) {
 		return
 	}
 
-	// Обработка ответа
-	p.handleResponse(response, post, channel)
-}
-
-func (p *Plugin) checkTriggerWords(wh *model.OutgoingWebhook, message string) bool {
-	if len(wh.TriggerWords) == 0 {
-		return true
-	}
-
-	messageLower := strings.ToLower(message)
-	for _, triggerWord := range wh.TriggerWords {
-		if wh.TriggerWhen == 1 {
-			// Проверяем, начинается ли сообщение с триггерного слова
-			if strings.HasPrefix(messageLower, strings.ToLower(triggerWord)) {
-				return true
+	mentionsNames := model.PossibleAtMentions(post.Message)
+	mentionsEmail := make(map[string]string)
+	for _, mentionedUsername := range mentionsNames {
+		mentionedUser, appErr := p.API.GetUserByUsername(mentionedUsername)
+		if appErr == nil && !mentionedUser.IsBot {
+			_, err := p.API.GetChannelMember(channel.Id, mentionedUser.Id)
+			if err != nil {
+				p.API.LogDebug("User mention is not a member of the channel",
+					"channel_id", channel.Id,
+					"username", mentionedUsername,
+					"error", err.Error())
+				continue
 			}
-		} else if wh.TriggerWhen == 0 {
-			// Проверяем, содержится ли триггерное слово в сообщении
-			if strings.Contains(messageLower, strings.ToLower(triggerWord)) {
-				return true
-			}
-		} else {
-			// По умолчанию проверяем, начинается ли сообщение с триггерного слова
-			if strings.HasPrefix(messageLower, strings.ToLower(triggerWord)) {
-				return true
-			}
+			mentionsEmail[mentionedUsername] = mentionedUser.Email
 		}
 	}
-	return false
-}
 
-func (p *Plugin) sendHTTPRequest(wh *model.OutgoingWebhook, post *model.Post, user *model.User, channel *model.Channel) (*http.Response, error) {
 	// Формируем данные для отправки (аналогично стандартным исходящим вебхукам)
 	data := map[string]interface{}{
-		"user_id":      user.Id,
-		"user_name":    user.Username,
-		"channel_id":   post.ChannelId,
-		"channel_name": channel.Name,
-		"team_id":      channel.TeamId,
-		"post_id":      post.Id,
-		"text":         post.Message,
-		"trigger_word": p.getTriggerWord(wh, post.Message),
-		"token":        wh.Token,
+		"timestamp":     post.CreateAt,
+		"user_id":       user.Id,
+		"user_name":     user.Username,
+		"channel_id":    post.ChannelId,
+		"channel_name":  channel.Name,
+		"team_id":       channel.TeamId,
+		"post_id":       post.Id,
+		"text":          post.Message,
+		"trigger_word":  triggerWord,
+		"token":         wh.Token,
+		"mentionsEmail": mentionsEmail,
 	}
 
 	jsonData, err := json.Marshal(data)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to marshal JSON data")
+		p.API.LogError("Failed to send HTTP request",
+			"webhook_id", wh.DisplayName,
+			"error", "failed to marshal JSON data")
+		return
 	}
 
-	// Определяем тип содержимого
+	for _, callbackURL := range wh.CallbackURLs {
+		// Отправка Webhook HTTP-запроса
+		response, err := p.sendHTTPRequest(wh, callbackURL, jsonData)
+		if err != nil {
+			p.API.LogError("Failed to send HTTP request",
+				"webhook_id", wh.DisplayName,
+				"error", err.Error())
+			continue
+		}
+
+		// Обработка ответа
+		p.handleResponse(response, post, channel)
+	}
+}
+
+func (p *Plugin) checkTriggerWords(wh *CustomOutgoingWebhook, message string) (bool, string) {
+	if len(wh.TriggerWords) == 0 {
+		return true, ""
+	}
+
+	messageLower := strings.ToLower(message)
+	for _, triggerWord := range wh.TriggerWords {
+		triggerWordLower := strings.ToLower(triggerWord)
+
+		switch wh.TriggerWhen {
+		case "startswith":
+			if strings.HasPrefix(messageLower, triggerWordLower) {
+				return true, triggerWord
+			}
+		case "exact":
+			// Экранируем спецсимволы и ищем как отдельное слово
+			pattern := `(^|[\s[:punct:]])` + regexp.QuoteMeta(triggerWordLower) + `($|[\s[:punct:]])`
+
+			re, err := regexp.Compile(pattern)
+			if err != nil {
+				p.API.LogError("Failed to compile regexp for trigger word", "trigger word", triggerWord, "error", err)
+				continue
+			}
+			if re.MatchString(messageLower) {
+				return true, triggerWord
+			}
+
+			// Логируем (только при включённой отладке)
+			if p.getConfiguration().Debug {
+				p.API.LogDebug("Trigger word NOT matched",
+					"message", message,
+					"trigger_word", triggerWord,
+					"pattern", pattern)
+			}
+		default:
+			// По умолчанию проверяем, начинается ли сообщение с триггерного слова
+			if strings.HasPrefix(messageLower, triggerWordLower) {
+				return true, triggerWord
+			}
+		}
+	}
+	return false, ""
+}
+
+// Проверка прав бота, если triggerWord — это @упоминание
+func (p *Plugin) checkAccessToChannel(wh *CustomOutgoingWebhook, channel *model.Channel, triggerWord string) bool {
+	if !wh.CheckBotAccess {
+		return true
+	}
+
+	if !strings.HasPrefix(triggerWord, "@") {
+		p.API.LogError("Trigger word is not mention, webhook will not trigger",
+			"trigger_word", triggerWord)
+		return false
+	}
+
+	mentionedUsername := strings.TrimPrefix(triggerWord, "@")
+	mentionedUser, appErr := p.API.GetUserByUsername(mentionedUsername)
+	if appErr != nil {
+		p.API.LogDebug("Failed to get user by trigger word mention, webhook will not trigger",
+			"channel_id", channel.Id,
+			"bot_username", mentionedUsername,
+			"error", appErr.Error())
+		return false
+	}
+
+	// Логируем (только при включённой отладке)
+	if p.getConfiguration().Debug {
+		p.API.LogDebug("User by trigger word mention found",
+			"trigger_word", triggerWord,
+			"mentionedUser", mentionedUser)
+	}
+
+	if mentionedUser.IsBot {
+		// Проверяем, состоит ли бот в канале
+		_, err := p.API.GetChannelMember(channel.Id, mentionedUser.Id)
+		if err != nil {
+			p.API.LogDebug("Bot is not a member of the channel, webhook will not trigger",
+				"channel_id", channel.Id,
+				"bot_username", mentionedUsername,
+				"error", err.Error())
+			return false
+		}
+	}
+
+	return true
+}
+
+func (p *Plugin) sendHTTPRequest(wh *CustomOutgoingWebhook, callbackURL string, jsonData []byte) (*http.Response, error) {
 	contentType := "application/x-www-form-urlencoded"
 	if wh.ContentType == "application/json" {
 		contentType = "application/json"
 	}
 
-	// Создаём и отправляем запрос
 	client := &http.Client{}
-	req, err := http.NewRequest("POST", wh.CallbackURLs[0], strings.NewReader(string(jsonData)))
+	req, err := http.NewRequest("POST", callbackURL, strings.NewReader(string(jsonData)))
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create HTTP request")
 	}
 
+	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("User-Agent", "Mattermost-Outgoing-Webhook-Plugin/1.0")
+	req.Header.Set("User-Agent", "Outgoing Webhook Enhancer/1.0")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -198,20 +247,6 @@ func (p *Plugin) sendHTTPRequest(wh *model.OutgoingWebhook, post *model.Post, us
 	}
 
 	return resp, nil
-}
-
-func (p *Plugin) getTriggerWord(wh *model.OutgoingWebhook, message string) string {
-	if len(wh.TriggerWords) == 0 {
-		return ""
-	}
-
-	messageLower := strings.ToLower(message)
-	for _, triggerWord := range wh.TriggerWords {
-		if strings.HasPrefix(messageLower, strings.ToLower(triggerWord)) {
-			return triggerWord
-		}
-	}
-	return ""
 }
 
 func (p *Plugin) handleResponse(resp *http.Response, post *model.Post, channel *model.Channel) {
@@ -248,4 +283,14 @@ func (p *Plugin) handleResponse(resp *http.Response, post *model.Post, channel *
 	if _, err := p.API.CreatePost(responsePost); err != nil {
 		p.API.LogError("Failed to create response post", "error", err.Error())
 	}
+}
+
+// Generic-функция, работает с любыми типами (string, int и т.д.)
+func contains[T comparable](slice []T, target T) bool {
+	for _, v := range slice {
+		if v == target {
+			return true
+		}
+	}
+	return false
 }

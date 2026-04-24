@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -18,7 +19,7 @@ type PostWithMentions struct {
 	MentionEmails map[string]string `json:"mention_emails"` // username -> email, пустая если enrich_mentions=false
 }
 
-// ServeHTTP обрабатывает HTTP-запросы
+// ServeHTTP обрабатывает HTTP-запросы плагина
 func (p *Plugin) ServeHTTP(c *plugin.Context, w http.ResponseWriter, r *http.Request) {
 	p.router.ServeHTTP(w, r)
 }
@@ -28,7 +29,7 @@ func (p *Plugin) initializeAPI() {
 	router := mux.NewRouter()
 
 	router.HandleFunc("/status", p.handleStatus).Methods("GET")
-	router.HandleFunc("/messages", p.handleMessages).Methods("GET")
+	router.HandleFunc("/{userId:[a-z0-9]{26}}/messages", p.handleUserMessages).Methods("GET")
 
 	p.router = router
 }
@@ -49,22 +50,12 @@ func (p *Plugin) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleMessages возвращает сообщения для текущего пользователя из всех каналов,
-// начиная с временной метки since, с ограничением limit (по умолчанию 100).
-func (p *Plugin) handleMessages(w http.ResponseWriter, r *http.Request) {
-	// 1. Проверка Bearer токена
-	token := r.Header.Get("Authorization")
-	if len(token) < 7 || token[:7] != "Bearer " {
-		http.Error(w, "Unauthorized: missing or malformed Bearer token", http.StatusUnauthorized)
+func (p *Plugin) handleUserMessages(w http.ResponseWriter, r *http.Request) {
+	// 1. Проверка авторизации
+	userID, sessionToken := p.getUserAndSession(w, r)
+	if userID == "" {
 		return
 	}
-	sessionToken := token[7:]
-	session, err := p.API.GetSession(sessionToken)
-	if err != nil || session == nil {
-		p.API.LogError("Invalid session", "error", err.Error())
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-	userID := session.UserId
 
 	// 2. Парсинг параметров запроса
 	query := r.URL.Query()
@@ -94,19 +85,96 @@ func (p *Plugin) handleMessages(w http.ResponseWriter, r *http.Request) {
 		enrichMentions = true
 	}
 
-	botUsername := query.Get("bot_username") // если пустая строка, фильтр не применяется
-	filterByBot := botUsername != ""
+	filterUsername := query.Get("bot_username") // если пустая строка, фильтр не применяется
+	filterByMention := filterUsername != ""
 
-	// 3. Получение всех каналов пользователя
-	channels, appErr := p.getUserChannels(userID, sessionToken)
+	// 3. Получение всех постов после since
+	allPosts, appErr := p.getAllSortedPosts(userID, sessionToken, since)
 	if appErr != nil {
-		p.API.LogError("Failed to get user channels", "error", appErr.Error())
+		p.API.LogError("Failed to get posts", "error", appErr.Error())
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
-	// 4. Сбор всех постов после since
+	selectedPosts := p.filterAndLimitPosts(allPosts, limit, filterByMention, filterUsername)
+
+	// 4. Обогащение email-упоминаниями (только если enrich_mentions=true)
+	result := make([]PostWithMentions, len(selectedPosts))
+	if enrichMentions {
+		result = p.enrichPostsEmailMentions(selectedPosts)
+	}
+
+	// 5. Ответ
+	w.Header().Set("Content-Type", "application/json")
+	if enrichMentions {
+		if err := json.NewEncoder(w).Encode(result); err != nil {
+			p.API.LogError("Failed to encode response", "error", err.Error())
+		}
+	} else {
+		if err := json.NewEncoder(w).Encode(selectedPosts); err != nil {
+			p.API.LogError("Failed to encode response", "error", err.Error())
+		}
+	}
+}
+
+// getUserAndSession Проверяет Bearer токен авторизации, возвращает ID пользователя и токен сессии
+func (p *Plugin) getUserAndSession(w http.ResponseWriter, r *http.Request) (string, string) {
+	vars := mux.Vars(r)
+	requestUserID := vars["userId"]
+	if requestUserID == "" {
+		http.Error(w, "Missing userId in path", http.StatusBadRequest)
+		return "", ""
+	}
+
+	token := r.Header.Get("Authorization")
+	if len(token) < 7 || token[:7] != "Bearer " {
+		http.Error(w, "Unauthorized: missing or malformed Bearer token", http.StatusUnauthorized)
+		return "", ""
+	}
+	sessionToken := token[7:]
+	session, err := p.API.GetSession(sessionToken)
+	if err != nil || session == nil {
+		p.API.LogError("Invalid session", "error", err.Error())
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return "", ""
+	}
+
+	// Получаем пользователя по токену
+	currentUser, appErr := p.API.GetUser(session.UserId)
+	if appErr != nil {
+		p.API.LogError("Failed to get user from session", "error", appErr.Error())
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return "", ""
+	}
+
+	// Проверяем, является ли он администратором
+	isAdmin := false
+	for _, role := range strings.Fields(currentUser.Roles) {
+		if role == model.SYSTEM_ADMIN_ROLE_ID {
+			isAdmin = true
+			break
+		}
+	}
+
+	// Доступ только к своим сообщениям или у администраторов
+	if !isAdmin && session.UserId != requestUserID {
+		http.Error(w, "Forbidden: you can only request messages for your own user", http.StatusForbidden)
+		return "", ""
+	}
+
+	return requestUserID, sessionToken
+}
+
+func (p *Plugin) getAllSortedPosts(userID string, sessionToken string, since int64) ([]*model.Post, *model.AppError) {
 	var allPosts []*model.Post
+	// Получение всех каналов пользователя
+	channels, appErr := p.getUserChannels(userID, sessionToken)
+	if appErr != nil {
+		p.API.LogError("Failed to get user channels", "error", appErr.Error())
+		return nil, appErr
+	}
+
+	// Сбор постов из каналов
 	for _, ch := range channels {
 		postList, appErr := p.API.GetPostsSince(ch.Id, since)
 		if appErr != nil {
@@ -120,27 +188,31 @@ func (p *Plugin) handleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 5. Сортировка по возрастанию CreateAt (самые ранние после since)
+	// Сортировка по возрастанию CreateAt (самые ранние после since)
 	sort.Slice(allPosts, func(i, j int) bool {
 		return allPosts[i].CreateAt < allPosts[j].CreateAt
 	})
 
-	// 6. Отбор сообщений с учётом фильтра по боту и лимита
+	return allPosts, nil
+}
+
+// filterAndLimitPosts отбирает сообщений с учётом фильтра по упоминаниям и лимита
+func (p *Plugin) filterAndLimitPosts(allPosts []*model.Post, limit int, filterByMention bool, filterUsername string) []*model.Post {
 	var selectedPosts []*model.Post
-	if filterByBot {
+	if filterByMention {
 		for _, post := range allPosts {
-			// Проверяем упоминание бота
+			// Проверяем упоминание
 			mentions := model.PossibleAtMentions(post.Message)
 			mentioned := false
 			for _, m := range mentions {
-				if m == botUsername {
+				if m == filterUsername {
 					mentioned = true
 					break
 				}
 			}
 			if mentioned {
 				selectedPosts = append(selectedPosts, post)
-				if len(selectedPosts) == limit {
+				if len(selectedPosts) >= limit {
 					break // Достигли лимита, останавливаем обход
 				}
 			}
@@ -154,61 +226,52 @@ func (p *Plugin) handleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 7. Обогащение email-упоминаниями (только если enrich_mentions=true)
+	return selectedPosts
+}
+
+func (p *Plugin) enrichPostsEmailMentions(selectedPosts []*model.Post) []PostWithMentions {
 	result := make([]PostWithMentions, len(selectedPosts))
-	if enrichMentions {
-		userCache := make(map[string]*model.User)
-		for _, post := range selectedPosts {
-			mentions := model.PossibleAtMentions(post.Message)
-			mentionEmails := make(map[string]string)
-			for _, username := range mentions {
-				// Ищем в кэше
-				user, ok := userCache[username]
-				if !ok {
-					var uErr *model.AppError
-					user, uErr = p.API.GetUserByUsername(username)
-					if uErr != nil {
-						userCache[username] = nil
-						continue
-					}
-					userCache[username] = user
-				}
-				if user == nil || user.IsBot {
+	userCache := make(map[string]*model.User)
+	for _, post := range selectedPosts {
+		mentions := model.PossibleAtMentions(post.Message)
+		mentionEmails := make(map[string]string)
+		for _, username := range mentions {
+			// Ищем в кэше
+			user, ok := userCache[username]
+			if !ok {
+				var uErr *model.AppError
+				user, uErr = p.API.GetUserByUsername(username)
+				if uErr != nil {
+					userCache[username] = nil
 					continue
 				}
-				// Проверка членства в канале
-				_, memberErr := p.API.GetChannelMember(post.ChannelId, user.Id)
-				if memberErr != nil {
-					p.API.LogDebug("User mention is not a member of the channel",
-						"channel_id", post.ChannelId,
-						"username", username,
-						"error", memberErr.Error())
-					continue
-				}
-				mentionEmails[username] = user.Email
+				userCache[username] = user
 			}
-			result = append(result, PostWithMentions{
-				Post:          post,
-				MentionEmails: mentionEmails,
-			})
+			if user == nil || user.IsBot {
+				continue
+			}
+			// Проверка членства в канале
+			_, memberErr := p.API.GetChannelMember(post.ChannelId, user.Id)
+			if memberErr != nil {
+				p.API.LogDebug("User mention is not a member of the channel",
+					"channel_id", post.ChannelId,
+					"username", username,
+					"error", memberErr.Error())
+				continue
+			}
+			mentionEmails[username] = user.Email
 		}
+		result = append(result, PostWithMentions{
+			Post:          post,
+			MentionEmails: mentionEmails,
+		})
 	}
 
-	// 8. Ответ
-	w.Header().Set("Content-Type", "application/json")
-	if enrichMentions {
-		if err := json.NewEncoder(w).Encode(result); err != nil {
-			p.API.LogError("Failed to encode response", "error", err.Error())
-		}
-	} else {
-		if err := json.NewEncoder(w).Encode(selectedPosts); err != nil {
-			p.API.LogError("Failed to encode response", "error", err.Error())
-		}
-	}
+	return result
 }
 
 // getUserChannels собирает все каналы пользователя (командные, открытые, приватные, прямые, групповые)
-func (p *Plugin) getUserChannels(userID, token string) ([]*model.Channel, *model.AppError) {
+func (p *Plugin) getUserChannels(userID string, token string) ([]*model.Channel, *model.AppError) {
 	var allChannels []*model.Channel
 
 	// Командные каналы

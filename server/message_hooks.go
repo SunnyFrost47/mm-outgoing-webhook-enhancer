@@ -82,43 +82,11 @@ func (p *Plugin) processWebhook(wh *CustomOutgoingWebhook, post *model.Post, use
 		return
 	}
 
-	mentionsNames := model.PossibleAtMentions(post.Message)
-	mentionsEmail := make(map[string]string)
-	for _, mentionedUsername := range mentionsNames {
-		mentionedUser, appErr := p.API.GetUserByUsername(mentionedUsername)
-		if appErr == nil && !mentionedUser.IsBot {
-			_, err := p.API.GetChannelMember(channel.Id, mentionedUser.Id)
-			if err != nil {
-				p.API.LogDebug("User mention is not a member of the channel",
-					"channel_id", channel.Id,
-					"username", mentionedUsername,
-					"error", err.Error())
-				continue
-			}
-			mentionsEmail[mentionedUsername] = mentionedUser.Email
-		}
-	}
-
-	// Формируем данные для отправки (аналогично стандартным исходящим вебхукам)
-	data := map[string]interface{}{
-		"timestamp":     post.CreateAt,
-		"user_id":       user.Id,
-		"user_name":     user.Username,
-		"channel_id":    post.ChannelId,
-		"channel_name":  channel.Name,
-		"team_id":       channel.TeamId,
-		"post_id":       post.Id,
-		"text":          post.Message,
-		"trigger_word":  triggerWord,
-		"token":         wh.Token,
-		"mentionsEmail": mentionsEmail,
-	}
-
-	jsonData, err := json.Marshal(data)
+	jsonData, err := p.createWebhookJson(wh, post, channel, user, triggerWord)
 	if err != nil {
-		p.API.LogError("Failed to send HTTP request",
+		p.API.LogError("Failed to generate JSON data",
 			"webhook_id", wh.DisplayName,
-			"error", "failed to marshal JSON data")
+			"error", err.Error())
 		return
 	}
 
@@ -223,6 +191,55 @@ func (p *Plugin) checkAccessToChannel(wh *CustomOutgoingWebhook, channel *model.
 	}
 
 	return true
+}
+
+// Формируем данные для отправки WebHook
+func (p *Plugin) createWebhookJson(wh *CustomOutgoingWebhook, post *model.Post, channel *model.Channel, user *model.User, triggerWord string) ([]byte, error) {
+	// Получаем список email-адресов упоминаний
+	mentionsNames := model.PossibleAtMentions(post.Message)
+	mentionsEmail := make(map[string]string)
+	for _, mentionedUsername := range mentionsNames {
+		mentionedUser, appErr := p.API.GetUserByUsername(mentionedUsername)
+		if appErr == nil && !mentionedUser.IsBot {
+			_, err := p.API.GetChannelMember(channel.Id, mentionedUser.Id)
+			if err != nil {
+				p.API.LogDebug("User mention is not a member of the channel",
+					"channel_id", channel.Id,
+					"username", mentionedUsername,
+					"error", err.Error())
+				continue
+			}
+			mentionsEmail[mentionedUsername] = mentionedUser.Email
+		}
+	}
+
+	// Получаем список ID файлов, прикреплённых к сообщению
+	var fileIds []string
+	if post.FileIds != nil {
+		fileIds = post.FileIds
+	}
+
+	data := map[string]interface{}{
+		"timestamp":     post.CreateAt,
+		"user_id":       user.Id,
+		"user_name":     user.Username,
+		"channel_id":    post.ChannelId,
+		"channel_name":  channel.Name,
+		"team_id":       channel.TeamId,
+		"post_id":       post.Id,
+		"text":          post.Message,
+		"trigger_word":  triggerWord,
+		"token":         wh.Token,
+		"mentionsEmail": mentionsEmail,
+		"file_ids":      fileIds,
+	}
+
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return nil, err
+	}
+
+	return jsonData, nil
 }
 
 func (p *Plugin) sendHTTPRequest(wh *CustomOutgoingWebhook, callbackURL string, jsonData []byte) (*http.Response, error) {

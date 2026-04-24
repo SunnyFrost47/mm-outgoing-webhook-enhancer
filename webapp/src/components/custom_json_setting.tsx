@@ -22,7 +22,7 @@ interface CustomJsonSettingProps {
 
 const CustomJsonSetting: React.FC<CustomJsonSettingProps> = ({
   id,
-  value = '[]', // Теперь по умолчанию пустой массив
+  value = '[]', // По умолчанию пустой массив
   onChange,
   disabled = false,
 }) => {

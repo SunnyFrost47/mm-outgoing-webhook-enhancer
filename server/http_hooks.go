@@ -22,12 +22,10 @@ func (p *Plugin) initializeAPI() {
 }
 
 func (p *Plugin) handleStatus(w http.ResponseWriter, r *http.Request) {
-	configuration := p.getConfiguration()
-
 	var response = struct {
 		Enabled bool `json:"enabled"`
 	}{
-		Enabled: !configuration.Debug,
+		Enabled: true,
 	}
 
 	responseJSON, _ := json.Marshal(response)

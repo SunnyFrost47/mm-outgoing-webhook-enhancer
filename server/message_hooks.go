@@ -197,7 +197,7 @@ func (p *Plugin) checkAccessToChannel(wh *CustomOutgoingWebhook, channel *model.
 func (p *Plugin) createWebhookJson(wh *CustomOutgoingWebhook, post *model.Post, channel *model.Channel, user *model.User, triggerWord string) ([]byte, error) {
 	// Получаем список email-адресов упоминаний
 	mentionsNames := model.PossibleAtMentions(post.Message)
-	mentionsEmail := make(map[string]string)
+	mentionEmails := make(map[string]string)
 	for _, mentionedUsername := range mentionsNames {
 		mentionedUser, appErr := p.API.GetUserByUsername(mentionedUsername)
 		if appErr == nil && !mentionedUser.IsBot {
@@ -209,7 +209,7 @@ func (p *Plugin) createWebhookJson(wh *CustomOutgoingWebhook, post *model.Post, 
 					"error", err.Error())
 				continue
 			}
-			mentionsEmail[mentionedUsername] = mentionedUser.Email
+			mentionEmails[mentionedUsername] = mentionedUser.Email
 		}
 	}
 
@@ -220,18 +220,18 @@ func (p *Plugin) createWebhookJson(wh *CustomOutgoingWebhook, post *model.Post, 
 	}
 
 	data := map[string]interface{}{
-		"timestamp":     post.CreateAt,
-		"user_id":       user.Id,
-		"user_name":     user.Username,
-		"channel_id":    post.ChannelId,
-		"channel_name":  channel.Name,
-		"team_id":       channel.TeamId,
-		"post_id":       post.Id,
-		"text":          post.Message,
-		"trigger_word":  triggerWord,
-		"token":         wh.Token,
-		"mentionsEmail": mentionsEmail,
-		"file_ids":      fileIds,
+		"timestamp":      post.CreateAt,
+		"user_id":        user.Id,
+		"user_name":      user.Username,
+		"channel_id":     post.ChannelId,
+		"channel_name":   channel.Name,
+		"team_id":        channel.TeamId,
+		"post_id":        post.Id,
+		"text":           post.Message,
+		"trigger_word":   triggerWord,
+		"token":          wh.Token,
+		"mention_emails": mentionEmails,
+		"file_ids":       fileIds,
 	}
 
 	jsonData, err := json.Marshal(data)

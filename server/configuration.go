@@ -42,8 +42,10 @@ type CustomOutgoingWebhook struct {
 	Token string `json:"secret"`
 	// ChannelIDs - ограничение каналов (пустой массив = все каналы).
 	ChannelIDs []string `json:"channel_ids"`
-	// Enabled - активен ли вебхук.
+	// CheckBotAccess - проверять ли доступ ботов к каналам.
 	CheckBotAccess bool `json:"check_bot_access"`
+	// EnrichEmails - обогащать ли email-адреса.
+	EnrichEmails bool `json:"enrich_emails"`
 }
 
 // Validate проверяет обязательные поля и корректность структуры.

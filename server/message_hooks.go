@@ -19,7 +19,7 @@ func (p *Plugin) MessageHasBeenPosted(c *plugin.Context, post *model.Post) {
 	}
 
 	// Игнорируем системные сообщения и сообщения от ботов
-	if strings.HasPrefix(post.Type, model.POST_SYSTEM_MESSAGE_PREFIX) {
+	if post.IsSystemMessage() || post.IsJoinLeaveMessage() {
 		return
 	}
 
@@ -27,6 +27,10 @@ func (p *Plugin) MessageHasBeenPosted(c *plugin.Context, post *model.Post) {
 	user, err := p.API.GetUser(post.UserId)
 	if err != nil {
 		p.API.LogError("Failed to get user", "error", err.Error())
+		return
+	}
+
+	if user.IsBot {
 		return
 	}
 
@@ -38,15 +42,11 @@ func (p *Plugin) MessageHasBeenPosted(c *plugin.Context, post *model.Post) {
 	}
 
 	customWebhooks := p.getConfiguration().OutgoingWebhooks
-
-	// Логируем полученные вебхуки (только при включённой отладке)
-	if p.getConfiguration().Debug {
-		p.API.LogDebug("Processing message for outgoing webhooks",
-			"message", post.Message,
-			"channel", channel.Name,
-			"channel_type", channel.Type,
-			"webhooks_count", len(customWebhooks))
-	}
+	p.API.LogDebug("Processing message for outgoing webhooks",
+		"message", post.Message,
+		"channel", channel.Name,
+		"channel_type", channel.Type,
+		"webhooks_count", len(customWebhooks))
 
 	// Обрабатываем каждый вебхук
 	for _, wh := range customWebhooks {
@@ -71,12 +71,9 @@ func (p *Plugin) processWebhook(wh *CustomOutgoingWebhook, post *model.Post, use
 		return
 	}
 
-	// Логируем (только при включённой отладке)
-	if p.getConfiguration().Debug {
-		p.API.LogDebug("Trigger Matched",
-			"trigger_word", triggerWord,
-			"check_bot_access", wh.CheckBotAccess)
-	}
+	p.API.LogDebug("Trigger Matched",
+		"trigger_word", triggerWord,
+		"check_bot_access", wh.CheckBotAccess)
 
 	if !p.checkAccessToChannel(wh, channel, triggerWord) {
 		return
@@ -132,13 +129,10 @@ func (p *Plugin) checkTriggerWords(wh *CustomOutgoingWebhook, message string) (b
 				return true, triggerWord
 			}
 
-			// Логируем (только при включённой отладке)
-			if p.getConfiguration().Debug {
-				p.API.LogDebug("Trigger word NOT matched",
-					"message", message,
-					"trigger_word", triggerWord,
-					"pattern", pattern)
-			}
+			p.API.LogDebug("Trigger word NOT matched",
+				"message", message,
+				"trigger_word", triggerWord,
+				"pattern", pattern)
 		default:
 			// По умолчанию проверяем, начинается ли сообщение с триггерного слова
 			if strings.HasPrefix(messageLower, triggerWordLower) {
@@ -171,12 +165,9 @@ func (p *Plugin) checkAccessToChannel(wh *CustomOutgoingWebhook, channel *model.
 		return false
 	}
 
-	// Логируем (только при включённой отладке)
-	if p.getConfiguration().Debug {
-		p.API.LogDebug("User by trigger word mention found",
-			"trigger_word", triggerWord,
-			"mentionedUser", mentionedUser)
-	}
+	p.API.LogDebug("User by trigger word mention found",
+		"trigger_word", triggerWord,
+		"mentionedUser", mentionedUser)
 
 	if mentionedUser.IsBot {
 		// Проверяем, состоит ли бот в канале
@@ -193,14 +184,40 @@ func (p *Plugin) checkAccessToChannel(wh *CustomOutgoingWebhook, channel *model.
 	return true
 }
 
-// Формируем данные для отправки WebHook
-func (p *Plugin) createWebhookJson(wh *CustomOutgoingWebhook, post *model.Post, channel *model.Channel, user *model.User, triggerWord string) ([]byte, error) {
+func (p *Plugin) createWebhookJson(wh *CustomOutgoingWebhook, post *model.Post, channel *model.Channel, user *model.User, triggerWord string) ([]byte, error) { // Получаем список ID файлов, прикреплённых к сообщению
+	var fileIds []string
+	if post.FileIds != nil {
+		fileIds = post.FileIds
+	}
+
+	data := map[string]interface{}{
+		"timestamp":    post.CreateAt,
+		"user_id":      user.Id,
+		"user_name":    user.Username,
+		"channel_id":   post.ChannelId,
+		"channel_name": channel.Name,
+		"team_id":      channel.TeamId,
+		"post_id":      post.Id,
+		"text":         post.Message,
+		"trigger_word": triggerWord,
+		"token":        wh.Token,
+		"file_ids":     fileIds,
+	}
+
 	// Получаем список email-адресов упоминаний
-	mentionsNames := model.PossibleAtMentions(post.Message)
-	mentionEmails := make(map[string]string)
-	for _, mentionedUsername := range mentionsNames {
-		mentionedUser, appErr := p.API.GetUserByUsername(mentionedUsername)
-		if appErr == nil && !mentionedUser.IsBot {
+	if wh.EnrichEmails {
+		mentionsNames := model.PossibleAtMentions(post.Message)
+		mentionEmails := make(map[string]string)
+		for _, mentionedUsername := range mentionsNames {
+			mentionedUser, appErr := p.API.GetUserByUsername(mentionedUsername)
+			if appErr != nil {
+				p.API.LogDebug("Failed to get mentioned user", "username", mentionedUsername, "error", appErr.Error())
+				continue
+			}
+			if mentionedUser == nil || mentionedUser.IsBot {
+				p.API.LogDebug("Mentioned user is nil or a bot, skipping", "username", mentionedUsername)
+				continue
+			}
 			_, err := p.API.GetChannelMember(channel.Id, mentionedUser.Id)
 			if err != nil {
 				p.API.LogDebug("User mention is not a member of the channel",
@@ -211,27 +228,8 @@ func (p *Plugin) createWebhookJson(wh *CustomOutgoingWebhook, post *model.Post, 
 			}
 			mentionEmails[mentionedUsername] = mentionedUser.Email
 		}
-	}
 
-	// Получаем список ID файлов, прикреплённых к сообщению
-	var fileIds []string
-	if post.FileIds != nil {
-		fileIds = post.FileIds
-	}
-
-	data := map[string]interface{}{
-		"timestamp":      post.CreateAt,
-		"user_id":        user.Id,
-		"user_name":      user.Username,
-		"channel_id":     post.ChannelId,
-		"channel_name":   channel.Name,
-		"team_id":        channel.TeamId,
-		"post_id":        post.Id,
-		"text":           post.Message,
-		"trigger_word":   triggerWord,
-		"token":          wh.Token,
-		"mention_emails": mentionEmails,
-		"file_ids":       fileIds,
+		data["mention_emails"] = mentionEmails
 	}
 
 	jsonData, err := json.Marshal(data)
@@ -242,6 +240,7 @@ func (p *Plugin) createWebhookJson(wh *CustomOutgoingWebhook, post *model.Post, 
 	return jsonData, nil
 }
 
+// sendHTTPRequest Отправляет HTTP-запрос WebHook
 func (p *Plugin) sendHTTPRequest(wh *CustomOutgoingWebhook, callbackURL string, jsonData []byte) (*http.Response, error) {
 	contentType := "application/x-www-form-urlencoded"
 	if wh.ContentType == "application/json" {
@@ -266,6 +265,7 @@ func (p *Plugin) sendHTTPRequest(wh *CustomOutgoingWebhook, callbackURL string, 
 	return resp, nil
 }
 
+// handleResponse Обрабатывает ответ WebHook
 func (p *Plugin) handleResponse(resp *http.Response, post *model.Post, channel *model.Channel) {
 	defer resp.Body.Close()
 
@@ -283,18 +283,73 @@ func (p *Plugin) handleResponse(resp *http.Response, post *model.Post, channel *
 		return
 	}
 
-	// Извлекаем текст для ответа
-	text, ok := responseData["text"].(string)
-	if !ok || text == "" {
+	text, _ := responseData["text"].(string)
+	if text == "" {
+		// Текст может быть пустым, если есть вложения — это допустимо
+		// Но если вообще нет ни текста, ни вложений, прекращаем
+		if _, ok := responseData["attachments"]; !ok {
+			return
+		}
+	}
+
+	// Получаем ID бота плагина и добавляем бота в канал, если нужно
+	botUserID := p.botUserID
+	if botUserID == "" {
+		p.API.LogError("Bot user ID is not configured")
 		return
 	}
 
-	// Отправляем ответное сообщение
+	targetChannelID := post.ChannelId
+	if channelId, ok := responseData["channel"].(string); ok && channelId != "" {
+		if ch, err := p.API.GetChannel(channelId); err == nil {
+			targetChannelID = ch.Id
+			p.API.LogDebug("Finded response specified channel",
+				"requested_channel", channelId,
+				"requested_channel_id", ch.Id,
+				"original_channel_id", post.ChannelId)
+		} else {
+			p.API.LogWarn("Response specified unknown channel, using original",
+				"requested_channel", channelId,
+				"original_channel_id", post.ChannelId)
+		}
+	}
+
+	// Переопределение имени и иконки бота
+	props := make(map[string]interface{})
+	if username, ok := responseData["username"].(string); ok && username != "" {
+		props["override_username"] = username
+	}
+	if iconURL, ok := responseData["icon_url"].(string); ok && iconURL != "" {
+		props["override_icon_url"] = iconURL
+	}
+	if attachments, ok := responseData["attachments"]; ok {
+		props["attachments"] = attachments
+	}
+
+	// Служебный флаг, чтобы система обрабатывала сообщение как webhook-ответ
+	props["from_webhook"] = "true"
+
+	// Добавляем пользовательские пропсы, если они переданы (исключаем уже обработанные ключи)
+	if customProps, ok := responseData["props"].(map[string]interface{}); ok {
+		for k, v := range customProps {
+			// Не перезаписываем ключевые поля безопасности и отображения
+			if k == "override_username" || k == "override_icon_url" || k == "from_webhook" || k == "attachments" {
+				continue
+			}
+			props[k] = v
+		}
+	}
+
+	messageType, _ := responseData["type"].(string)
+
+	// Создаём пост
 	responsePost := &model.Post{
-		ChannelId: post.ChannelId,
+		ChannelId: targetChannelID,
 		Message:   text,
 		RootId:    post.Id, // Ответ в ту же ветку (thread)
-		UserId:    post.UserId,
+		UserId:    botUserID,
+		Type:      messageType,
+		Props:     props,
 	}
 
 	if _, err := p.API.CreatePost(responsePost); err != nil {

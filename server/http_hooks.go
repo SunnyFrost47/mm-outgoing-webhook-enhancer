@@ -6,7 +6,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/mattermost/mattermost-server/v5/model"
@@ -85,8 +84,8 @@ func (p *Plugin) handleUserMessages(w http.ResponseWriter, r *http.Request) {
 		enrichMentions = true
 	}
 
-	filterUsername := query.Get("bot_username") // если пустая строка, фильтр не применяется
-	filterByMention := filterUsername != ""
+	mentionFilter := query.Get("mention") // если пустая строка, фильтр не применяется
+	filterByMention := mentionFilter != ""
 
 	// 3. Получение всех постов после since
 	allPosts, appErr := p.getAllSortedPosts(userID, sessionToken, since)
@@ -96,11 +95,14 @@ func (p *Plugin) handleUserMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	selectedPosts := p.filterAndLimitPosts(allPosts, limit, filterByMention, filterUsername)
+	selectedPosts := p.filterAndLimitPosts(allPosts, limit, filterByMention, mentionFilter)
+	if selectedPosts == nil {
+		selectedPosts = []*model.Post{}
+	}
 
 	// 4. Обогащение email-упоминаниями (только если enrich_mentions=true)
 	result := make([]PostWithMentions, len(selectedPosts))
-	if enrichMentions {
+	if enrichMentions && len(selectedPosts) > 0 {
 		result = p.enrichPostsEmailMentions(selectedPosts)
 	}
 
@@ -126,8 +128,9 @@ func (p *Plugin) getUserAndSession(w http.ResponseWriter, r *http.Request) (stri
 		return "", ""
 	}
 
-	token := r.Header.Get("Authorization")
+	token := r.Header.Get("X-Mattermost-Token")
 	if len(token) < 7 || token[:7] != "Bearer " {
+		p.API.LogDebug("Invalid Authorization token", "token", r.Header)
 		http.Error(w, "Unauthorized: missing or malformed Bearer token", http.StatusUnauthorized)
 		return "", ""
 	}
@@ -197,7 +200,7 @@ func (p *Plugin) getAllSortedPosts(userID string, sessionToken string, since int
 }
 
 // filterAndLimitPosts отбирает сообщений с учётом фильтра по упоминаниям и лимита
-func (p *Plugin) filterAndLimitPosts(allPosts []*model.Post, limit int, filterByMention bool, filterUsername string) []*model.Post {
+func (p *Plugin) filterAndLimitPosts(allPosts []*model.Post, limit int, filterByMention bool, mentionFilter string) []*model.Post {
 	var selectedPosts []*model.Post
 	if filterByMention {
 		for _, post := range allPosts {
@@ -205,7 +208,7 @@ func (p *Plugin) filterAndLimitPosts(allPosts []*model.Post, limit int, filterBy
 			mentions := model.PossibleAtMentions(post.Message)
 			mentioned := false
 			for _, m := range mentions {
-				if m == filterUsername {
+				if m == mentionFilter {
 					mentioned = true
 					break
 				}
@@ -232,7 +235,7 @@ func (p *Plugin) filterAndLimitPosts(allPosts []*model.Post, limit int, filterBy
 func (p *Plugin) enrichPostsEmailMentions(selectedPosts []*model.Post) []PostWithMentions {
 	result := make([]PostWithMentions, len(selectedPosts))
 	userCache := make(map[string]*model.User)
-	for _, post := range selectedPosts {
+	for i, post := range selectedPosts {
 		mentions := model.PossibleAtMentions(post.Message)
 		mentionEmails := make(map[string]string)
 		for _, username := range mentions {
@@ -261,10 +264,10 @@ func (p *Plugin) enrichPostsEmailMentions(selectedPosts []*model.Post) []PostWit
 			}
 			mentionEmails[username] = user.Email
 		}
-		result = append(result, PostWithMentions{
+		result[i] = PostWithMentions{
 			Post:          post,
 			MentionEmails: mentionEmails,
-		})
+		}
 	}
 
 	return result
@@ -289,35 +292,24 @@ func (p *Plugin) getUserChannels(userID string, token string) ([]*model.Channel,
 
 	// Личные каналы (прямые и групповые) через REST API, т.к. Plugin API 5.31 не имеет массовой выдачи
 	// Выполняем GET /api/v4/users/{user_id}/channels – он возвращает и DM/GM
-	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequest("GET", "http://localhost:8065/api/v4/users/"+userID+"/channels", nil) // адрес вашего Mattermost
-	if err != nil {
-		return nil, model.NewAppError("getUserChannels", "http_request_failed", nil, err.Error(), http.StatusInternalServerError)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	teamId := teams[0].Id
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, model.NewAppError("getUserChannels", "http_request_failed", nil, err.Error(), http.StatusInternalServerError)
+	// Инициализация клиента API v4
+	siteURL := *p.API.GetConfig().ServiceSettings.SiteURL
+	if siteURL == "" {
+		return nil, model.NewAppError("getUserChannels", "plugin.site_url_empty", nil, "SiteURL is empty", 500)
 	}
-	defer resp.Body.Close()
+	client := model.NewAPIv4Client(siteURL)
+	client.SetToken(token)
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, model.NewAppError("getUserChannels", "bad_response", nil, resp.Status, resp.StatusCode)
+	channels, resp := client.GetChannelsForTeamForUser(teamId, userID, false, userID)
+	if resp.Error != nil {
+		return nil, resp.Error
 	}
 
-	var channels []*model.Channel
-	if err := json.NewDecoder(resp.Body).Decode(&channels); err != nil {
-		return nil, model.NewAppError("getUserChannels", "json_decode_failed", nil, err.Error(), http.StatusInternalServerError)
-	}
-
-	// Добавляем только не дублирующиеся (вдруг командные попали снова)
-	exist := make(map[string]bool)
-	for _, ch := range allChannels {
-		exist[ch.Id] = true
-	}
+	// Добавляем только DM/GM
 	for _, ch := range channels {
-		if !exist[ch.Id] {
+		if ch.Type == model.CHANNEL_DIRECT || ch.Type == model.CHANNEL_GROUP {
 			allChannels = append(allChannels, ch)
 		}
 	}
